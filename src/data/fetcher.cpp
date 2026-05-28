@@ -9,6 +9,29 @@
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
 
+// WiFiClient::read() returns -1 immediately when the TCP receive buffer is
+// empty, even mid-response. ArduinoJson treats -1 as EOF → IncompleteInput.
+// This wrapper blocks in read() until a byte arrives or the connection drops.
+class BlockingWiFiStream : public Stream {
+    WiFiClient *_c;
+    uint32_t    _timeout_ms;
+public:
+    explicit BlockingWiFiStream(WiFiClient *c, uint32_t timeout_ms = 10000)
+        : _c(c), _timeout_ms(timeout_ms) {}
+    int      available() override { return _c->available(); }
+    int      peek()      override { return _c->peek(); }
+    size_t   write(uint8_t b) override { return _c->write(b); }
+    void     flush()     override {}
+    int      read()      override {
+        uint32_t deadline = millis() + _timeout_ms;
+        while (!_c->available()) {
+            if (!_c->connected() || millis() > deadline) return -1;
+            vTaskDelay(1);
+        }
+        return _c->read();
+    }
+};
+
 static volatile NetType _active_net = NET_NONE;
 
 static AircraftList *_aircraft_list = nullptr;
@@ -16,6 +39,13 @@ static uint32_t _last_update = 0;
 static TaskHandle_t _fetch_task_handle = nullptr;
 static TaskHandle_t _route_task_handle = nullptr;
 static FetcherStats _fstats = {};
+
+// One-shot closest aircraft request
+static volatile bool _closest_pending = false;
+static float   _closest_req_lat    = 0.0f;
+static float   _closest_req_lon    = 0.0f;
+static int     _closest_req_radius = 20;
+static ClosestCb _closest_cb       = nullptr;
 
 // Military alert dedup
 #define ALERTED_MAX 64
@@ -76,9 +106,6 @@ struct ParsedEntry {
     bool on_ground;
     float mach;
     int16_t ias, tas;
-    int32_t nav_altitude;
-    float roll;
-    float nav_qnh;
 };
 
 static void apply_parsed(Aircraft &a, const ParsedEntry &p, bool is_new) {
@@ -100,9 +127,6 @@ static void apply_parsed(Aircraft &a, const ParsedEntry &p, bool is_new) {
     a.mach = p.mach;
     a.ias = p.ias;
     a.tas = p.tas;
-    a.nav_altitude = p.nav_altitude;
-    a.roll = p.roll;
-    a.nav_qnh = p.nav_qnh;
     a.is_military = check_military(a.icao_hex);
     a.is_emergency = check_emergency(a.squawk);
     a.is_watched = false;
@@ -156,9 +180,6 @@ static void parse_aircraft_json(JsonDocument &doc) {
         p.mach = obj["mach"] | 0.0f;
         p.ias = (int16_t)(obj["ias"] | 0.0f);
         p.tas = (int16_t)(obj["tas"] | 0.0f);
-        p.nav_altitude = obj["nav_altitude_mcp"] | 0;
-        p.roll = obj["roll"] | 0.0f;
-        p.nav_qnh = obj["nav_qnh"] | 0.0f;
         parsed_count++;
     }
 
@@ -258,32 +279,11 @@ static void fetch_task(void *param) {
                 if (httpCode == HTTP_CODE_OK) {
                     _fstats.last_fetch_ms = millis() - t0;
 
-                    // Read full response with deadline loop (fixes truncated JSON)
                     int content_len = http.getSize();
-                    size_t buf_size = (content_len > 0) ? (size_t)content_len + 1 : 64 * 1024;
-                    char *buf = (char *)malloc(buf_size);
-                    size_t total = 0;
+                    if (content_len > 0) _fstats.bytes_received += content_len;
 
-                    if (buf) {
-                        size_t target = (content_len > 0) ? (size_t)content_len : buf_size - 1;
-                        WiFiClient *stream = http.getStreamPtr();
-                        uint32_t deadline = millis() + 15000;
-                        while (total < target && millis() < deadline) {
-                            int avail = stream->available();
-                            if (avail > 0) {
-                                int to_read = min((size_t)avail, target - total);
-                                total += stream->readBytes(buf + total, to_read);
-                            } else if (!stream->connected()) {
-                                break;
-                            } else {
-                                vTaskDelay(1);
-                            }
-                        }
-                        buf[total] = '\0';
-                    }
-                    _fstats.bytes_received += total;
-
-                    // Parse with filter — only extract fields we need
+                    // Parse directly from stream — no full-response buffer needed,
+                    // avoiding the 40–80 KB malloc that causes NoMemory on the CYD.
                     JsonDocument filter;
                     JsonObject af = filter["ac"][0].to<JsonObject>();
                     af["hex"] = true;
@@ -303,15 +303,10 @@ static void fetch_task(void *param) {
                     af["mach"] = true;
                     af["ias"] = true;
                     af["tas"] = true;
-                    af["nav_altitude_mcp"] = true;
-                    af["roll"] = true;
-                    af["nav_qnh"] = true;
 
+                    BlockingWiFiStream stream(http.getStreamPtr());
                     JsonDocument doc;
-                    DeserializationError err = (buf && total > 0)
-                        ? deserializeJson(doc, buf, total, DeserializationOption::Filter(filter))
-                        : DeserializationError::EmptyInput;
-                    if (buf) free(buf);
+                    DeserializationError err = deserializeJson(doc, stream, DeserializationOption::Filter(filter));
 
                     if (!err) {
                         _fstats.fetch_ok++;
@@ -349,6 +344,38 @@ static void route_enrich_task(void *param) {
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     while (true) {
+        // One-shot: resolve closest aircraft via API
+        if (_closest_pending) {
+            _closest_pending = false;
+            if (network_connected() && http_mutex_acquire(pdMS_TO_TICKS(12000))) {
+                char clos_url[128];
+                snprintf(clos_url, sizeof(clos_url),
+                         "https://api.adsb.lol/v2/closest/%.4f/%.4f/%d",
+                         _closest_req_lat, _closest_req_lon, _closest_req_radius);
+                WiFiClientSecure clos_client;
+                clos_client.setInsecure();
+                clos_client.setHandshakeTimeout(8);
+                HTTPClient clos_http;
+                clos_http.begin(clos_client, clos_url);
+                clos_http.setTimeout(8000);
+                if (clos_http.GET() == HTTP_CODE_OK) {
+                    JsonDocument clos_filter;
+                    clos_filter["ac"][0]["hex"] = true;
+                    JsonDocument clos_doc;
+                    if (!deserializeJson(clos_doc, *clos_http.getStreamPtr(),
+                                        DeserializationOption::Filter(clos_filter))) {
+                        JsonArray ac = clos_doc["ac"].as<JsonArray>();
+                        if (ac.size() > 0) {
+                            const char *hex = ac[0]["hex"] | "";
+                            if (_closest_cb && hex[0]) _closest_cb(hex);
+                        }
+                    }
+                }
+                clos_http.end();
+                http_mutex_release();
+            }
+        }
+
         char callsign[9] = {};
         char icao_hex[7] = {};
         bool found = false;
@@ -450,4 +477,12 @@ uint32_t fetcher_last_update() {
 
 const FetcherStats* fetcher_get_stats() {
     return &_fstats;
+}
+
+void fetcher_request_closest(float lat, float lon, int radius_nm, ClosestCb cb) {
+    _closest_req_lat    = lat;
+    _closest_req_lon    = lon;
+    _closest_req_radius = radius_nm;
+    _closest_cb         = cb;
+    _closest_pending    = true;
 }

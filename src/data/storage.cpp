@@ -28,7 +28,7 @@ UserConfig storage_load_config() {
     cfg.cycle_inactivity_s = 60;
     cfg.trails_enabled = true;
     cfg.trail_max_points = 30;
-    cfg.trail_style = 0;
+    cfg.trail_style = 1;
     cfg.brightness = 255;
     cfg.night_mode = false;
     cfg.map_zoom_idx = 1;    // 50nm default

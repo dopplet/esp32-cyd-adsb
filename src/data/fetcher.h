@@ -27,3 +27,8 @@ struct FetcherStats {
     char ip_addr[16];
 };
 const FetcherStats* fetcher_get_stats();
+
+// Request a one-shot fetch of the closest aircraft to the given point.
+// Callback is invoked from the fetcher task with the ICAO hex of the result.
+typedef void (*ClosestCb)(const char *icao_hex);
+void fetcher_request_closest(float lat, float lon, int radius_nm, ClosestCb cb);

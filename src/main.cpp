@@ -1,4 +1,4 @@
-// ADS-B Radar Display — CYD (ESP32-2432S028)
+// ADS-B Radar Display â€” CYD (ESP32-2432S028)
 // 320x240 landscape, TFT_eSPI direct rendering, no LVGL
 // Features: radar, arrivals, stats, detail, flight log
 //   compass rose, auto-cycle, brightness, night mode,
@@ -26,6 +26,7 @@
 #define XPT2046_CS    33
 
 TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite status_spr(&tft);
 SPIClass touchSPI = SPIClass(VSPI);
 
 static AircraftList aircraft_list;
@@ -108,16 +109,15 @@ static const ColorPalette *pal = &PALETTE_GREEN;
 #define RADAR_R   (RADAR_H / 2 - 4)
 
 // Range options (nm)
-static const float RANGES[] = {150, 100, 50, 20, 5};
-static const int NUM_RANGES = 5;
-static int range_idx = 1;
+static const float RANGES[] = {ADSB_RADIUS_NM, 10, 5, 1};
+static const int NUM_RANGES = 4;
+static int range_idx = 0;
 
 // ---- View state ----
 
-enum ViewMode { VIEW_LOADING, VIEW_RADAR, VIEW_ARRIVALS, VIEW_STATS, VIEW_DETAIL, VIEW_LOG, VIEW_SETTINGS };
+enum ViewMode { VIEW_LOADING, VIEW_RADAR, VIEW_INFO, VIEW_SETTINGS };
 static ViewMode current_view = VIEW_LOADING;
 static bool view_changed = true;
-static int detail_idx = 0;
 
 // Sweep
 static float sweep_angle = 0;
@@ -132,6 +132,7 @@ struct BlipState {
     uint8_t r;
     bool has_heading;
     bool has_label;
+    bool has_info;
 };
 static BlipState prev_blips[MAX_AIRCRAFT];
 static int prev_blip_count = 0;
@@ -141,6 +142,7 @@ struct TrailState {
     int16_t x[TRAIL_LENGTH];
     int16_t y[TRAIL_LENGTH];
     uint8_t count;
+    uint8_t style;  // 0=line, 1=dots — captured at draw time so erase matches
 };
 static TrailState prev_trails[MAX_AIRCRAFT];
 static int prev_trail_count = 0;
@@ -150,11 +152,6 @@ static int prev_trail_count = 0;
 static uint32_t last_touch_time = 0;
 static uint32_t last_cycle_time = 0;
 
-// ---- Arrivals sort ----
-
-enum ArrSort { SORT_DIST, SORT_ALT, SORT_SPEED };
-static ArrSort arr_sort = SORT_DIST;
-static const char *SORT_LABELS[] = {"DST", "ALT", "SPD"};
 
 // ---- Alert state ----
 
@@ -198,6 +195,12 @@ static int log_count = 0;
 static int log_write_idx = 0;
 static int log_page = 0;
 
+// ---- Info view state ----
+
+static char g_info_icao[7] = "";
+static AircraftEnrichment *g_info_enrich = nullptr;
+static uint32_t last_info_draw = 0;
+
 // ---- Long-press detection ----
 
 static uint32_t touch_down_time = 0;
@@ -206,15 +209,15 @@ static int saved_tx = 0;
 static int saved_ty = 0;
 
 // ---- Settings view ----
-#define NUM_SETTINGS 7
-static int settings_sel = 0;  // selected row
+#define NUM_SETTINGS 4
+static int settings_sel = -1;  // -1 = none, 0..N-1 = selected row (options shown)
 static const char *SETTINGS_LABELS[] = {
-    "AUTO CYCLE", "CYCLE INTERVAL", "INACTIVITY PAUSE",
     "ALERT MILITARY", "ALERT EMERGENCY", "TRAILS", "TRAIL STYLE"
 };
-static const int CYCLE_INTERVALS[] = {15, 30, 60, 90};
-static const int INACTIVITY_VALS[] = {30, 60, 120};
 #define LONG_PRESS_MS 1000
+#define SETTINGS_ROW_H   22
+#define SETTINGS_FIRST_Y (RADAR_Y + 23)
+#define SETTINGS_OPT_Y   (SETTINGS_FIRST_Y + NUM_SETTINGS * SETTINGS_ROW_H + 6)
 
 // ---- Helpers ----
 
@@ -225,6 +228,60 @@ static float distance_nm(float lat, float lon) {
     float nm_north = dlat * 60.0f;
     float nm_east = dlon * 60.0f * cos_lat;
     return sqrtf(nm_north * nm_north + nm_east * nm_east);
+}
+
+static bool find_nearest_aircraft(char *out_icao, float *out_dist) {
+    float best = 2.0f;  // only show aircraft within 2nm
+    bool found = false;
+    uint32_t now = millis();
+    if (aircraft_list.lock(pdMS_TO_TICKS(50))) {
+        for (int i = 0; i < aircraft_list.count; i++) {
+            Aircraft &a = aircraft_list.aircraft[i];
+            if (a.lat == 0.0f && a.lon == 0.0f) continue;
+            if (compute_aircraft_opacity(a.stale_since, now) == 0) continue;
+            float d = distance_nm(a.lat, a.lon);
+            if (d < best) {
+                best = d;
+                strlcpy(out_icao, a.icao_hex, 7);
+                if (out_dist) *out_dist = d;
+                found = true;
+            }
+        }
+        aircraft_list.unlock();
+    }
+    return found;
+}
+
+static void info_enrichment_cb(AircraftEnrichment *data) {
+    g_info_enrich = data;
+    view_changed = true;
+}
+
+// Called back from fetcher task when /v2/closest/ resolves
+static void closest_result_cb(const char *icao_hex) {
+    if (!icao_hex || !icao_hex[0]) return;
+    strlcpy(g_info_icao, icao_hex, sizeof(g_info_icao));
+    if (aircraft_list.lock(pdMS_TO_TICKS(50))) {
+        for (int i = 0; i < aircraft_list.count; i++) {
+            Aircraft &a = aircraft_list.aircraft[i];
+            if (strcmp(a.icao_hex, icao_hex) == 0) {
+                enrichment_fetch(icao_hex, a.registration, a.callsign, info_enrichment_cb);
+                break;
+            }
+        }
+        aircraft_list.unlock();
+    }
+    view_changed = true;
+}
+
+static void enter_info_view() {
+    g_info_enrich = nullptr;
+    g_info_icao[0] = '\0';
+    fetcher_request_closest(HOME_LAT, HOME_LON, ADSB_RADIUS_NM, closest_result_cb);
+    current_view = VIEW_INFO;
+    view_changed = true;
+    last_info_draw = 0;
+    tft.fillRect(0, STATUS_H, LCD_H_RES, RADAR_H, pal->bg);
 }
 
 static bool latlon_to_radar(float lat, float lon, int &px, int &py) {
@@ -263,8 +320,8 @@ static bool getTouchPoint(int &tx, int &ty) {
     if (digitalRead(XPT2046_IRQ) != LOW) return false;
     uint32_t sumX = 0, sumY = 0;
     for (int i = 0; i < 4; i++) {
-        sumX += touchRead16(0xD0);
-        sumY += touchRead16(0x90);
+        sumX += touchRead16(0x90);  // Y+ electrode = horizontal axis on CYD landscape
+        sumY += touchRead16(0xD0);  // X+ electrode = vertical axis on CYD landscape
     }
     tx = map(sumX / 4, TOUCH_X_MIN, TOUCH_X_MAX, 0, 319);
     ty = map(sumY / 4, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, 239);
@@ -307,140 +364,118 @@ static void toggle_night_mode() {
 // ---- View cycling ----
 
 static void cycle_view() {
-    switch (current_view) {
-        case VIEW_RADAR:    current_view = VIEW_ARRIVALS;  view_changed = true; break;
-        case VIEW_ARRIVALS: current_view = VIEW_STATS;     view_changed = true; break;
-        case VIEW_STATS:    current_view = VIEW_LOG;       view_changed = true; break;
-        case VIEW_LOG:      current_view = VIEW_SETTINGS;  view_changed = true; break;
-        case VIEW_SETTINGS: current_view = VIEW_RADAR;     radar_needs_full_redraw = true; break;
-        case VIEW_DETAIL:   current_view = VIEW_RADAR;     radar_needs_full_redraw = true; break;
-        default: break;
-    }
-}
-
-// Arrivals row → aircraft index mapping (for touch-to-detail)
-static int arrivals_ac_idx[MAX_AIRCRAFT];
-static int arrivals_row_count = 0;
-static int arrivals_list_y = 0;
-
-// ---- Touch handlers per view ----
-
-// Touch zones: 45% left, 10% center, 45% right
-#define TOUCH_LEFT_MAX  (LCD_H_RES * 9 / 20)  // 144
-#define TOUCH_RIGHT_MIN (LCD_H_RES * 11 / 20) // 176
-
-static void handle_touch_radar(int tx) {
-    if (tx < TOUCH_LEFT_MAX) {
-        // Left: cycle filter
-        filter_cycle();
+    if (current_view == VIEW_SETTINGS) {
+        current_view = VIEW_RADAR;
         radar_needs_full_redraw = true;
-    } else if (tx > TOUCH_RIGHT_MIN) {
-        // Right: cycle range
-        int old = range_idx;
-        range_idx = (range_idx + 1) % NUM_RANGES;
-        if (range_idx != old) radar_needs_full_redraw = true;
-    } else {
-        cycle_view();
+        settings_sel = -1;
     }
-}
-
-static void handle_touch_arrivals(int tx, int ty) {
-    if (tx < TOUCH_LEFT_MAX) {
-        // Left: cycle sort
-        arr_sort = (ArrSort)((arr_sort + 1) % 3);
-        view_changed = true;
-    } else if (tx > TOUCH_RIGHT_MIN) {
-        // Right: cycle range
-        range_idx = (range_idx + 1) % NUM_RANGES;
-        view_changed = true;
-    } else {
-        // Center: tap row to open detail, or cycle view if header area
-        int row = (ty - arrivals_list_y) / 16;
-        if (row >= 0 && row < arrivals_row_count) {
-            detail_idx = arrivals_ac_idx[row];
-            current_view = VIEW_DETAIL;
-            view_changed = true;
-        } else {
-            cycle_view();
-        }
-    }
-}
-
-static void handle_touch_stats(int tx, bool is_long_press) {
-    if (tx < TOUCH_LEFT_MAX) {
-        adjust_brightness(-32);
-        view_changed = true;
-    } else if (tx > TOUCH_RIGHT_MIN) {
-        adjust_brightness(32);
-        view_changed = true;
-    } else {
-        if (is_long_press) {
-            toggle_night_mode();
-        } else {
-            cycle_view();
-        }
-    }
-}
-
-static void handle_touch_detail(int tx) {
-    if (tx < TOUCH_LEFT_MAX) {
-        detail_idx--;
-        view_changed = true;
-    } else if (tx > TOUCH_RIGHT_MIN) {
-        detail_idx++;
-        view_changed = true;
-    } else {
-        cycle_view();
-    }
-}
-
-static void handle_touch_log(int tx) {
-    if (tx < TOUCH_LEFT_MAX) {
-        if (log_page > 0) log_page--;
-        view_changed = true;
-    } else if (tx > TOUCH_RIGHT_MIN) {
-        log_page++;
-        view_changed = true;
-    } else {
-        cycle_view();
-    }
-}
-
-static void settings_adjust_selected() {
-    switch (settings_sel) {
-        case 0: // Auto cycle on/off
-            g_config.cycle_enabled = !g_config.cycle_enabled;
-            break;
-        case 1: { // Cycle interval
-            int i = 0;
-            for (; i < 4; i++) if (CYCLE_INTERVALS[i] == g_config.cycle_interval_s) break;
-            g_config.cycle_interval_s = CYCLE_INTERVALS[(i + 1) % 4];
-            break;
-        }
-        case 2: { // Inactivity pause
-            int i = 0;
-            for (; i < 3; i++) if (INACTIVITY_VALS[i] == g_config.cycle_inactivity_s) break;
-            g_config.cycle_inactivity_s = INACTIVITY_VALS[(i + 1) % 3];
-            break;
-        }
-        case 3: g_config.alert_military = !g_config.alert_military; break;
-        case 4: g_config.alert_emergency = !g_config.alert_emergency; break;
-        case 5: g_config.trails_enabled = !g_config.trails_enabled; break;
-        case 6: g_config.trail_style = g_config.trail_style ? 0 : 1; break;
-    }
-    storage_save_config(g_config);
     view_changed = true;
 }
 
-static void handle_touch_settings(int tx) {
-    if (tx < TOUCH_LEFT_MAX) {
-        settings_sel = (settings_sel - 1 + NUM_SETTINGS) % NUM_SETTINGS;
+static void handle_touch_info(int tx, int ty) {
+    // Bottom-right back button (radar glyph)
+    if (tx > 270 && ty > 205) {
+        current_view = VIEW_RADAR;
+        radar_needs_full_redraw = true;
         view_changed = true;
-    } else if (tx > TOUCH_RIGHT_MIN) {
-        settings_sel = (settings_sel + 1) % NUM_SETTINGS;
+        tft.fillRect(0, STATUS_H, LCD_H_RES, RADAR_H, pal->bg);
+        return;
+    }
+    // Header bar: same zones as radar view
+    if (ty < STATUS_H) {
+        if (tx < 40) {
+            current_view = VIEW_SETTINGS;
+            view_changed = true;
+            tft.fillRect(0, STATUS_H, LCD_H_RES, RADAR_H, pal->bg);
+        } else if (tx <= 220) {
+            filter_cycle();
+        } else {
+            range_idx = (range_idx + 1) % NUM_RANGES;
+        }
+    }
+}
+
+// ---- Touch handlers per view ----
+
+static void handle_touch_radar(int tx, int ty) {
+    // Info view button (bottom-right tile)
+    if (tx > 270 && ty > 205) {
+        enter_info_view();
+        return;
+    }
+    if (ty >= STATUS_H) return;
+    if (tx < 40) {
+        // WiFi label â†’ go to settings
+        current_view = VIEW_SETTINGS;
         view_changed = true;
+    } else if (tx <= 220) {
+        // AC count / filter label â†’ cycle filter
+        filter_cycle();
+        radar_needs_full_redraw = true;
     } else {
+        // Range label â†’ cycle range
+        range_idx = (range_idx + 1) % NUM_RANGES;
+        radar_needs_full_redraw = true;
+    }
+}
+
+static int get_setting_options(int sel, const char **labels, int *active_opt) {
+    switch (sel) {
+        case 0:
+            labels[0] = "OFF"; labels[1] = "ON";
+            *active_opt = g_config.alert_military ? 1 : 0;
+            return 2;
+        case 1:
+            labels[0] = "OFF"; labels[1] = "ON";
+            *active_opt = g_config.alert_emergency ? 1 : 0;
+            return 2;
+        case 2:
+            labels[0] = "OFF"; labels[1] = "ON";
+            *active_opt = g_config.trails_enabled ? 1 : 0;
+            return 2;
+        case 3:
+            labels[0] = "LINE"; labels[1] = "DOTS";
+            *active_opt = g_config.trail_style;
+            return 2;
+        default: return 0;
+    }
+}
+
+static void apply_setting(int sel, int opt) {
+    switch (sel) {
+        case 0: g_config.alert_military  = (opt == 1); break;
+        case 1: g_config.alert_emergency = (opt == 1); break;
+        case 2: g_config.trails_enabled  = (opt == 1); break;
+        case 3: g_config.trail_style     = opt;         break;
+    }
+    storage_save_config(g_config);
+}
+
+static void handle_touch_settings(int tx, int ty) {
+    if (ty < STATUS_H) {
+        if (tx < 40) cycle_view();
+        return;
+    }
+    if (ty < SETTINGS_FIRST_Y) {
         cycle_view();
+        return;
+    }
+    if (settings_sel >= 0 && ty >= SETTINGS_OPT_Y) {
+        const char *labels[3];
+        int active_opt;
+        int n_opts = get_setting_options(settings_sel, labels, &active_opt);
+        if (n_opts > 0) {
+            int opt = constrain(tx * n_opts / LCD_H_RES, 0, n_opts - 1);
+            apply_setting(settings_sel, opt);
+        }
+        settings_sel = -1;
+        view_changed = true;
+        return;
+    }
+    if (ty < SETTINGS_FIRST_Y + NUM_SETTINGS * SETTINGS_ROW_H) {
+        int row = constrain((ty - SETTINGS_FIRST_Y) / SETTINGS_ROW_H, 0, NUM_SETTINGS - 1);
+        settings_sel = (settings_sel == row) ? -1 : row;
+        view_changed = true;
     }
 }
 
@@ -453,58 +488,48 @@ static void draw_status_bar(bool force) {
     if (!force && now - last_status_draw < 1000) return;
     last_status_draw = now;
 
-    tft.fillRect(0, 0, LCD_H_RES, STATUS_H, pal->status_bg);
-    tft.setTextColor(pal->status, pal->status_bg);
-    tft.setTextDatum(TL_DATUM);
+    // Draw into sprite â€” pushed to display in one SPI transfer, no visible blank frame
+    status_spr.fillSprite(pal->status_bg);
+    status_spr.setTextColor(pal->status, pal->status_bg);
+    status_spr.setTextDatum(TL_DATUM);
 
     // WiFi status
     const char *net = fetcher_wifi_connected() ? "WiFi" : "---";
-    tft.drawString(net, 2, 3, 2);
+    status_spr.drawString(net, 2, 3, 2);
 
-    // View + Aircraft count
+    // Aircraft count
     char buf[24];
-    const char *vn = "RDR";
-    if (current_view == VIEW_ARRIVALS) vn = "ARR";
-    else if (current_view == VIEW_STATS) vn = "STA";
-    else if (current_view == VIEW_DETAIL) vn = "DTL";
-    else if (current_view == VIEW_LOG) vn = "LOG";
-    else if (current_view == VIEW_SETTINGS) vn = "SET";
+    const char *vn = current_view == VIEW_SETTINGS ? "SET" :
+                     current_view == VIEW_INFO     ? "NFO" : "RDR";
     snprintf(buf, sizeof(buf), "%s %dAC", vn, aircraft_list.count);
-    tft.drawString(buf, 45, 3, 2);
+    status_spr.drawString(buf, 45, 3, 2);
 
     // Filter indicator (if active)
     int filt = filter_get_active();
     if (filt >= 0 && filt < NUM_FILTERS) {
-        tft.setTextColor(filter_defs[filt].color, pal->status_bg);
-        tft.drawString(filter_defs[filt].label, 120, 3, 2);
-        tft.setTextColor(pal->status, pal->status_bg);
-    }
-
-    // Auto-cycle indicator
-    if (g_config.cycle_enabled) {
-        tft.setTextDatum(TR_DATUM);
-        bool paused = (now - last_touch_time) < ((uint32_t)g_config.cycle_inactivity_s * 1000);
-        tft.setTextColor(paused ? pal->grid : pal->status, pal->status_bg);
-        tft.drawString("AUT", 210, 3, 1);
-        tft.setTextColor(pal->status, pal->status_bg);
+        status_spr.setTextColor(filter_defs[filt].color, pal->status_bg);
+        status_spr.drawString(filter_defs[filt].label, 120, 3, 2);
+        status_spr.setTextColor(pal->status, pal->status_bg);
     }
 
     // Range
-    tft.setTextDatum(TR_DATUM);
+    status_spr.setTextDatum(TR_DATUM);
     snprintf(buf, sizeof(buf), "%dnm", (int)RANGES[range_idx]);
-    tft.drawString(buf, 316, 3, 2);
+    status_spr.drawString(buf, 316, 3, 2);
 
     // Last update age
     uint32_t age = (now - fetcher_last_update()) / 1000;
     if (fetcher_last_update() > 0) {
         snprintf(buf, sizeof(buf), "%lus", age);
-        tft.drawString(buf, 260, 3, 2);
+        status_spr.drawString(buf, 260, 3, 2);
     }
 
     // Free heap (tiny font center)
     snprintf(buf, sizeof(buf), "%luK", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(buf, 160, 14, 1);
+    status_spr.setTextDatum(MC_DATUM);
+    status_spr.drawString(buf, 160, 14, 1);
+
+    status_spr.pushSprite(0, 0);
 }
 
 // ---- Loading animation ----
@@ -578,6 +603,38 @@ static void draw_loading() {
 
 // ---- Radar view ----
 
+static void draw_radar_glyph(int cx, int cy, uint16_t col) {
+    tft.drawCircle(cx, cy, 10, col);              // outer ring
+    tft.drawCircle(cx, cy,  6, col);              // mid ring
+    tft.drawCircle(cx, cy,  2, col);              // inner ring
+    tft.drawLine(cx-10, cy, cx+10, cy, col);      // horizontal crosshair
+    tft.drawLine(cx, cy-10, cx, cy+10, col);      // vertical crosshair
+    tft.fillCircle(cx, cy, 1, col);               // centre dot
+}
+
+static const uint8_t AIRPLANE_BMP[] PROGMEM = {
+    0x01, 0x80,  // row  0: ......xx........
+    0x03, 0xC0,  // row  1: .....xxxx.......
+    0x03, 0xC0,  // row  2: .....xxxx.......
+    0x03, 0xC0,  // row  3: .....xxxx.......
+    0x03, 0xC0,  // row  4: .....xxxx.......
+    0x07, 0xE0,  // row  5: ....xxxxxx......
+    0x0F, 0xF0,  // row  6: ...xxxxxxxx.....
+    0x1F, 0xF8,  // row  7: ..xxxxxxxxxx....
+    0x3F, 0xFC,  // row  8: .xxxxxxxxxxxx...
+    0x7B, 0xDE,  // row  9: .xxxx.xxxx.xxxx.
+    0xE3, 0xC7,  // row 10: xxx....xxxx....x  (note: MSB=left)
+    0x83, 0xC1,  // row 11: x......xxxx.....  (note: MSB=left)
+    0x03, 0xC0,  // row 12: .....xxxx.......
+    0x0F, 0xF0,  // row 13: ...xxxxxxxx.....
+    0x1F, 0xF8,  // row 14: ..xxxxxxxxxx....
+    0x39, 0x9C,  // row 15: ..xxx..xx..xxx..
+};
+
+static void draw_plane_glyph(int cx, int cy, uint16_t col) {
+    tft.drawBitmap(cx - 8, cy - 8, AIRPLANE_BMP, 16, 16, col);
+}
+
 static void draw_radar() {
     if (radar_needs_full_redraw) {
         tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
@@ -585,6 +642,21 @@ static void draw_radar() {
         prev_blip_count = 0;
         prev_trail_count = 0;
         prev_sweep_angle = -1;
+        // Draw rings immediately so they're visible even when no aircraft match the filter.
+        // The incremental repair block is gated on aircraft presence + new data, so without
+        // this initial paint the rings never appear on empty-filter screens.
+        for (int i = 1; i <= 3; i++) {
+            int r = RADAR_R * i / 3;
+            tft.drawCircle(RADAR_CX, RADAR_CY, r, pal->ring);
+        }
+        tft.drawLine(RADAR_CX - RADAR_R, RADAR_CY, RADAR_CX + RADAR_R, RADAR_CY, pal->grid);
+        tft.drawLine(RADAR_CX, RADAR_CY - RADAR_R, RADAR_CX, RADAR_CY + RADAR_R, pal->grid);
+        tft.setTextColor(pal->ring, pal->bg);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("N", RADAR_CX, RADAR_CY - RADAR_R + 6, 1);
+        tft.drawString("S", RADAR_CX, RADAR_CY + RADAR_R - 6, 1);
+        tft.drawString("E", RADAR_CX + RADAR_R - 6, RADAR_CY, 1);
+        tft.drawString("W", RADAR_CX - RADAR_R + 6, RADAR_CY, 1);
     }
 
     // Erase old sweep
@@ -598,8 +670,13 @@ static void draw_radar() {
     // Erase old trails
     for (int i = 0; i < prev_trail_count; i++) {
         TrailState &t = prev_trails[i];
-        for (int j = 1; j < t.count; j++)
-            tft.drawLine(t.x[j-1], t.y[j-1], t.x[j], t.y[j], pal->bg);
+        if (t.style == 1) {
+            for (int j = 0; j < t.count; j++)
+                tft.drawPixel(t.x[j], t.y[j], pal->bg);
+        } else {
+            for (int j = 1; j < t.count; j++)
+                tft.drawLine(t.x[j-1], t.y[j-1], t.x[j], t.y[j], pal->bg);
+        }
     }
 
     // Erase old blips
@@ -607,24 +684,20 @@ static void draw_radar() {
         BlipState &b = prev_blips[i];
         tft.fillCircle(b.x, b.y, b.r, pal->bg);
         if (b.has_heading) tft.drawLine(b.x, b.y, b.hx, b.hy, pal->bg);
-        if (b.has_label) tft.fillRect(b.x + 4, b.y - 12, 56, 18, pal->bg);
+        if (b.has_label) tft.fillRect(b.x + 4, b.y - 12, 76, b.has_info ? 24 : 12, pal->bg);
     }
 
-    // Redraw static: rings + crosshair
+    // Repair rings every frame: the sweep erases one ring-crossing per frame
+    // unconditionally, so a data-gated repair (every ~7.5s) leaves up to 113
+    // damaged pixels accumulated across the ring circumference — essentially
+    // the full ring eaten away before each repair. Cost: ~1326 drawPixel calls
+    // per frame at 15fps, negligible on ESP32/ILI9341.
     for (int i = 1; i <= 3; i++) {
         int r = RADAR_R * i / 3;
         tft.drawCircle(RADAR_CX, RADAR_CY, r, pal->ring);
     }
     tft.drawLine(RADAR_CX - RADAR_R, RADAR_CY, RADAR_CX + RADAR_R, RADAR_CY, pal->grid);
     tft.drawLine(RADAR_CX, RADAR_CY - RADAR_R, RADAR_CX, RADAR_CY + RADAR_R, pal->grid);
-
-    // Compass rose: N/S/E/W at ring edges
-    tft.setTextColor(pal->ring, pal->bg);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("N", RADAR_CX, RADAR_CY - RADAR_R + 6, 1);
-    tft.drawString("S", RADAR_CX, RADAR_CY + RADAR_R - 6, 1);
-    tft.drawString("E", RADAR_CX + RADAR_R - 6, RADAR_CY, 1);
-    tft.drawString("W", RADAR_CX - RADAR_R + 6, RADAR_CY, 1);
 
     // Sweep line
     float rad = sweep_angle * M_PI / 180.0f;
@@ -657,9 +730,10 @@ static void draw_radar() {
             if (opacity == 0) continue;
 
             // Trail
-            if (a.trail_count > 1 && new_trail_count < MAX_AIRCRAFT) {
+            if (g_config.trails_enabled && a.trail_count > 1 && new_trail_count < MAX_AIRCRAFT) {
                 TrailState &ts = prev_trails[new_trail_count];
                 ts.count = 0;
+                ts.style = g_config.trail_style;
                 for (int t = 0; t < a.trail_count && ts.count < TRAIL_LENGTH; t++) {
                     int tx, ty;
                     if (latlon_to_radar(a.trail[t].lat, a.trail[t].lon, tx, ty)) {
@@ -668,8 +742,13 @@ static void draw_radar() {
                         ts.count++;
                     }
                 }
-                for (int t = 1; t < ts.count; t++)
-                    tft.drawLine(ts.x[t-1], ts.y[t-1], ts.x[t], ts.y[t], pal->trail);
+                if (ts.style == 1) {
+                    for (int t = 0; t < ts.count; t++)
+                        tft.drawPixel(ts.x[t], ts.y[t], pal->trail);
+                } else {
+                    for (int t = 1; t < ts.count; t++)
+                        tft.drawLine(ts.x[t-1], ts.y[t-1], ts.x[t], ts.y[t], pal->trail);
+                }
                 new_trail_count++;
             }
 
@@ -696,7 +775,7 @@ static void draw_radar() {
 
             BlipState &b = prev_blips[new_blip_count];
             b.x = px; b.y = py; b.r = blip_r;
-            b.has_heading = false; b.has_label = false;
+            b.has_heading = false; b.has_label = false; b.has_info = false;
 
             // Heading line
             if (a.heading > 0 && !a.on_ground) {
@@ -707,26 +786,26 @@ static void draw_radar() {
                 b.has_heading = true; b.hx = hx; b.hy = hy;
             }
 
-            // Labels
-            if (behind < 180) {
-                tft.setTextColor(fade_color, pal->bg);
+            // Callsign always visible; alt/speed only when freshly swept
+            tft.setTextColor(fade_color, pal->bg);
+            if (a.callsign[0]) {
                 tft.setTextDatum(BL_DATUM);
-                if (a.callsign[0])
-                    tft.drawString(a.callsign, px + 4, py - 2, 1);
-                if (behind < 60) {
-                    char info[16];
-                    if (a.altitude > 0)
-                        snprintf(info, sizeof(info), "%d %dk", a.altitude / 100, a.speed);
-                    else if (a.on_ground)
-                        snprintf(info, sizeof(info), "GND %dk", a.speed);
-                    else
-                        info[0] = '\0';
-                    if (info[0]) {
-                        tft.setTextDatum(TL_DATUM);
-                        tft.drawString(info, px + 4, py + 2, 1);
-                    }
-                }
+                tft.drawString(a.callsign, px + 4, py - 2, 1);
                 b.has_label = true;
+            }
+            if (behind < 60) {
+                char info[20];
+                if (a.altitude > 0)
+                    snprintf(info, sizeof(info), "%d %dk", (int)a.altitude, a.speed);
+                else if (a.on_ground)
+                    snprintf(info, sizeof(info), "GND %dk", a.speed);
+                else
+                    info[0] = '\0';
+                if (info[0]) {
+                    tft.setTextDatum(TL_DATUM);
+                    tft.drawString(info, px + 4, py + 2, 1);
+                    b.has_info = true;
+                }
             }
 
             new_blip_count++;
@@ -736,7 +815,7 @@ static void draw_radar() {
     prev_blip_count = new_blip_count;
     prev_trail_count = new_trail_count;
 
-    // Range labels
+    // Range labels (drawn last to stay readable over aircraft)
     tft.setTextColor(pal->ring, pal->bg);
     tft.setTextDatum(TC_DATUM);
     for (int i = 1; i <= 3; i++) {
@@ -745,500 +824,338 @@ static void draw_radar() {
         snprintf(buf, sizeof(buf), "%d", (int)(RANGES[range_idx] * i / 3));
         tft.drawString(buf, RADAR_CX + 2, RADAR_CY - r + 2, 1);
     }
-}
 
-// ---- Arrivals board ----
-
-static uint32_t last_arrivals_draw = 0;
-
-static void draw_arrivals() {
-    uint32_t now = millis();
-    if (!view_changed && now - last_arrivals_draw < 2000) return;
-
-    if (view_changed) {
-        tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
-        view_changed = false;
-    }
-    last_arrivals_draw = now;
-
-    int y = RADAR_Y + 2;
-    tft.setTextColor(pal->hdr, pal->bg);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString("CALL", 4, y, 2);
-    tft.drawString("ROUTE", 84, y, 2);
-    tft.drawString("ALT", 168, y, 2);
-    tft.drawString("SPD", 222, y, 2);
-    tft.drawString("DIST", 278, y, 2);
-
-    // Sort indicator
-    tft.setTextDatum(TR_DATUM);
-    char sort_buf[8];
-    snprintf(sort_buf, sizeof(sort_buf), "[%s]", SORT_LABELS[arr_sort]);
-    tft.drawString(sort_buf, 316, y, 1);
-
-    y += 17;
-    tft.drawLine(0, y, LCD_H_RES, y, pal->hdr);
-    y += 3;
-
-    struct Entry {
-        char call[9];
-        char route[10];
-        int32_t alt;
-        int16_t spd;
-        int16_t dist;
-        bool mil;
-        bool emg;
-        int ac_idx;  // index into aircraft_list.aircraft[]
-    };
-    static Entry entries[MAX_AIRCRAFT];
-    int n = 0;
-
-    if (aircraft_list.lock(pdMS_TO_TICKS(100))) {
-        for (int i = 0; i < aircraft_list.count && n < MAX_AIRCRAFT; i++) {
-            Aircraft &a = aircraft_list.aircraft[i];
-            if (a.lat == 0.0f && a.lon == 0.0f) continue;
-            if (compute_aircraft_opacity(a.stale_since, millis()) == 0) continue;
-            if (!aircraft_passes_filter(a)) continue;
-
-            Entry &e = entries[n];
-            e.ac_idx = i;
-            strlcpy(e.call, a.callsign[0] ? a.callsign : a.icao_hex, sizeof(e.call));
-            if (a.origin[0] && a.origin[0] != '-' && a.dest[0] && a.dest[0] != '-')
-                snprintf(e.route, sizeof(e.route), "%s>%s", a.origin, a.dest);
-            else if (a.type_code[0])
-                strlcpy(e.route, a.type_code, sizeof(e.route));
-            else
-                strlcpy(e.route, "---", sizeof(e.route));
-            e.alt = a.altitude;
-            e.spd = a.speed;
-            e.dist = (int16_t)distance_nm(a.lat, a.lon);
-            e.mil = a.is_military;
-            e.emg = a.is_emergency;
-            n++;
-        }
-        aircraft_list.unlock();
-    }
-
-    // Sort by selected mode
-    for (int i = 1; i < n; i++) {
-        Entry tmp = entries[i];
-        int j = i - 1;
-        while (j >= 0) {
-            bool swap = false;
-            switch (arr_sort) {
-                case SORT_DIST:  swap = entries[j].dist > tmp.dist; break;
-                case SORT_ALT:   swap = entries[j].alt < tmp.alt; break;
-                case SORT_SPEED: swap = entries[j].spd < tmp.spd; break;
-            }
-            if (!swap) break;
-            entries[j + 1] = entries[j];
-            j--;
-        }
-        entries[j + 1] = tmp;
-    }
-
-    int max_rows = (RADAR_Y + RADAR_H - y) / 16;
-    int drawn = 0;
-    char buf[16];
-    arrivals_list_y = y;
-    arrivals_row_count = 0;
-
-    for (int i = 0; i < n && drawn < max_rows; i++) {
-        Entry &e = entries[i];
-        uint16_t color = pal->blip;
-        if (e.emg) color = pal->blip_emg;
-        else if (e.mil) color = pal->blip_mil;
-
-        tft.setTextColor(color, pal->bg);
-        tft.setTextDatum(TL_DATUM);
-
-        snprintf(buf, sizeof(buf), "%-8s", e.call);
-        tft.drawString(buf, 4, y, 2);
-        snprintf(buf, sizeof(buf), "%-7s", e.route);
-        tft.drawString(buf, 84, y, 2);
-        if (e.alt > 0) snprintf(buf, sizeof(buf), "%-4d", e.alt / 100);
-        else snprintf(buf, sizeof(buf), "GND ");
-        tft.drawString(buf, 168, y, 2);
-        snprintf(buf, sizeof(buf), "%-4d", e.spd);
-        tft.drawString(buf, 222, y, 2);
-        snprintf(buf, sizeof(buf), "%-3d", e.dist);
-        tft.drawString(buf, 278, y, 2);
-
-        arrivals_ac_idx[drawn] = e.ac_idx;
-        y += 16;
-        drawn++;
-    }
-    arrivals_row_count = drawn;
-
-    if (y < RADAR_Y + RADAR_H)
-        tft.fillRect(0, y, LCD_H_RES, RADAR_Y + RADAR_H - y, pal->bg);
-}
-
-// ---- Stats screen ----
-
-static uint32_t last_stats_draw = 0;
-
-static void draw_stats() {
-    uint32_t now = millis();
-    if (!view_changed && now - last_stats_draw < 2000) return;
-
-    if (view_changed) {
-        tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
-        view_changed = false;
-    }
-    last_stats_draw = now;
-
-    const FetcherStats *fs = fetcher_get_stats();
-    char buf[32];
-    int y = RADAR_Y + 4;
-    int col1 = 4, col2 = 170;
-
-    auto row = [&](const char *label, const char *value) {
-        tft.setTextColor(pal->hdr, pal->bg);
-        tft.setTextDatum(TL_DATUM);
-        tft.drawString(label, col1, y, 2);
-        tft.setTextColor(pal->blip, pal->bg);
-        tft.drawString(value, col2, y, 2);
-        y += 18;
-    };
-
-    uint32_t up = now / 1000;
-    snprintf(buf, sizeof(buf), "%luh %lum %lus   ", up / 3600, (up % 3600) / 60, up % 60);
-    row("UPTIME", buf);
-    row("IP ADDR", fs->ip_addr);
-    snprintf(buf, sizeof(buf), "%d dBm   ", WiFi.RSSI());
-    row("WIFI RSSI", buf);
-    snprintf(buf, sizeof(buf), "%lu ok / %lu fail   ", fs->fetch_ok, fs->fetch_fail);
-    row("FETCHES", buf);
-    snprintf(buf, sizeof(buf), "%lu ok / %lu fail   ", fs->enrich_ok, fs->enrich_fail);
-    row("ENRICH", buf);
-    snprintf(buf, sizeof(buf), "%lu ms   ", fs->last_fetch_ms);
-    row("FETCH TIME", buf);
-    snprintf(buf, sizeof(buf), "%d   ", aircraft_list.count);
-    row("AIRCRAFT", buf);
-
-    // Live closest/highest/fastest
-    float closest_d = 9999;
-    int32_t highest_alt = 0;
-    int16_t fastest_spd = 0;
-    char closest_call[9] = "---";
-    char highest_call[9] = "---";
-    char fastest_call[9] = "---";
-
-    if (aircraft_list.lock(pdMS_TO_TICKS(50))) {
-        for (int i = 0; i < aircraft_list.count; i++) {
-            Aircraft &a = aircraft_list.aircraft[i];
-            if (a.lat == 0.0f && a.lon == 0.0f) continue;
-            float d = distance_nm(a.lat, a.lon);
-            if (d < closest_d) { closest_d = d; strlcpy(closest_call, a.callsign[0] ? a.callsign : a.icao_hex, 9); }
-            if (a.altitude > highest_alt) { highest_alt = a.altitude; strlcpy(highest_call, a.callsign[0] ? a.callsign : a.icao_hex, 9); }
-            if (a.speed > fastest_spd) { fastest_spd = a.speed; strlcpy(fastest_call, a.callsign[0] ? a.callsign : a.icao_hex, 9); }
-        }
-        aircraft_list.unlock();
-    }
-
-    snprintf(buf, sizeof(buf), "%s %.0fnm   ", closest_call, closest_d < 9999 ? closest_d : 0.0f);
-    row("CLOSEST", buf);
-    snprintf(buf, sizeof(buf), "%s FL%ld   ", highest_call, highest_alt / 100);
-    row("HIGHEST", buf);
-    snprintf(buf, sizeof(buf), "%s %dkt   ", fastest_call, fastest_spd);
-    row("FASTEST", buf);
-
-    // Closest approach record
-    snprintf(buf, sizeof(buf), "%s %.1fnm   ", closest_record.callsign, closest_record.distance_nm < 9999 ? closest_record.distance_nm : 0.0f);
-    row("RECORD CLS", buf);
-
-    // Brightness
-    snprintf(buf, sizeof(buf), "%d%%   ", (int)(g_config.brightness * 100 / 255));
-    row("BRIGHTNESS", buf);
-}
-
-// ---- Detail screen ----
-
-static uint32_t last_detail_draw = 0;
-
-static void draw_detail() {
-    uint32_t now = millis();
-    if (!view_changed && now - last_detail_draw < 1000) return;
-
-    if (view_changed) {
-        tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
-        view_changed = false;
-    }
-    last_detail_draw = now;
-
-    if (aircraft_list.count == 0) {
-        tft.setTextColor(pal->hdr, pal->bg);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString("No aircraft", LCD_H_RES / 2, LCD_V_RES / 2, 2);
-        return;
-    }
-
-    if (detail_idx >= aircraft_list.count) detail_idx = 0;
-    if (detail_idx < 0) detail_idx = aircraft_list.count - 1;
-
-    Aircraft a;
-    bool got = false;
-    if (aircraft_list.lock(pdMS_TO_TICKS(50))) {
-        a = aircraft_list.aircraft[detail_idx];
-        got = true;
-        aircraft_list.unlock();
-    }
-    if (!got) return;
-
-    tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
-
-    int y = RADAR_Y + 2;
-    char buf[40];
-
-    // Header
-    tft.setTextColor(pal->text, pal->bg);
-    tft.setTextDatum(TL_DATUM);
-    snprintf(buf, sizeof(buf), "%d/%d", detail_idx + 1, aircraft_list.count);
-    tft.drawString(buf, 4, y, 1);
-
-    uint16_t hi_color = a.is_emergency ? pal->blip_emg : a.is_military ? pal->blip_mil : pal->blip;
-    tft.setTextColor(hi_color, pal->bg);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(a.callsign[0] ? a.callsign : a.icao_hex, LCD_H_RES / 2, y + 6, 4);
-    y += 28;
-
-    int col1 = 4, col3 = 170;
-
-    auto label_val = [&](int lx, int vx, const char *label, const char *value) {
-        tft.setTextColor(pal->hdr, pal->bg);
-        tft.setTextDatum(TL_DATUM);
-        tft.drawString(label, lx, y, 1);
-        tft.setTextColor(pal->blip, pal->bg);
-        tft.drawString(value, vx, y, 1);
-    };
-
-    label_val(col1, col1 + 30, "HEX", a.icao_hex);
-    label_val(col3, col3 + 30, "REG", a.registration[0] ? a.registration : "---");
-    y += 12;
-    label_val(col1, col1 + 30, "TYP", a.type_code[0] ? a.type_code : "---");
-    label_val(col3, col3 + 30, "CAT", a.category[0] ? a.category : "---");
-    y += 12;
-
-    tft.setTextColor(pal->hdr, pal->bg);
-    tft.drawString("DESC", col1, y, 1);
-    tft.setTextColor(pal->blip, pal->bg);
-    tft.drawString(a.desc[0] ? a.desc : "---", col1 + 36, y, 1);
-    y += 12;
-
-    tft.setTextColor(pal->hdr, pal->bg);
-    tft.drawString("OPR", col1, y, 1);
-    tft.setTextColor(pal->blip, pal->bg);
-    tft.drawString(a.owner_op[0] ? a.owner_op : "---", col1 + 36, y, 1);
-    y += 12;
-
-    snprintf(buf, sizeof(buf), "%s > %s",
-        (a.origin[0] && a.origin[0] != '-') ? a.origin : "???",
-        (a.dest[0] && a.dest[0] != '-') ? a.dest : "???");
-    label_val(col1, col1 + 36, "RTE", buf);
-    float dist = distance_nm(a.lat, a.lon);
-    snprintf(buf, sizeof(buf), "%.0fnm", dist);
-    label_val(col3, col3 + 30, "DST", buf);
-    y += 14;
-
-    tft.drawLine(0, y, LCD_H_RES, y, pal->grid);
-    y += 4;
-
-    snprintf(buf, sizeof(buf), "%ld ft", a.altitude);
-    label_val(col1, col1 + 24, "AL", a.on_ground ? "GND" : buf);
-    snprintf(buf, sizeof(buf), "%d kt", a.speed);
-    label_val(col3, col3 + 24, "GS", buf);
-    y += 12;
-
-    snprintf(buf, sizeof(buf), "%d", a.heading);
-    label_val(col1, col1 + 24, "HD", buf);
-    snprintf(buf, sizeof(buf), "%d fpm", a.vert_rate);
-    label_val(col3, col3 + 24, "VS", buf);
-    y += 12;
-
-    snprintf(buf, sizeof(buf), "%04d", a.squawk);
-    label_val(col1, col1 + 24, "SQ", buf);
-    if (a.mach > 0) snprintf(buf, sizeof(buf), "M%.2f", a.mach);
-    else strlcpy(buf, "---", sizeof(buf));
-    label_val(col3, col3 + 24, "MA", buf);
-    y += 12;
-
-    snprintf(buf, sizeof(buf), "%d kt", a.ias);
-    label_val(col1, col1 + 30, "IAS", a.ias > 0 ? buf : "---");
-    snprintf(buf, sizeof(buf), "%d kt", a.tas);
-    label_val(col3, col3 + 30, "TAS", a.tas > 0 ? buf : "---");
-    y += 12;
-
-    tft.setTextColor(pal->grid, pal->bg);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("< prev    tap: next    next >", LCD_H_RES / 2, RADAR_Y + RADAR_H - 8, 1);
-}
-
-// ---- Flight log view ----
-
-static uint32_t last_log_draw = 0;
-
-static void draw_log() {
-    uint32_t now = millis();
-    if (!view_changed && now - last_log_draw < 2000) return;
-
-    if (view_changed) {
-        tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
-        view_changed = false;
-    }
-    last_log_draw = now;
-
-    int y = RADAR_Y + 2;
-    tft.setTextColor(pal->hdr, pal->bg);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString("CALL", 4, y, 2);
-    tft.drawString("TYPE", 84, y, 2);
-    tft.drawString("CLS", 134, y, 2);
-    tft.drawString("AGO", 184, y, 2);
-    tft.drawString("FLAGS", 254, y, 2);
-
-    char pg_buf[12];
-    int total_pages = (log_count + 11) / 12;
-    if (total_pages < 1) total_pages = 1;
-    if (log_page >= total_pages) log_page = total_pages - 1;
-    snprintf(pg_buf, sizeof(pg_buf), "%d/%d", log_page + 1, total_pages);
-    tft.setTextDatum(TR_DATUM);
-    tft.drawString(pg_buf, 316, y, 1);
-
-    y += 17;
-    tft.drawLine(0, y, LCD_H_RES, y, pal->hdr);
-    y += 3;
-
-    if (log_count == 0) {
-        tft.setTextColor(pal->grid, pal->bg);
-        tft.setTextDatum(MC_DATUM);
-        tft.drawString("No flights logged", LCD_H_RES / 2, LCD_V_RES / 2, 2);
-        return;
-    }
-
-    int max_rows = (RADAR_Y + RADAR_H - y) / 14;
-    int start = log_page * max_rows;
-    int drawn = 0;
-    char buf[16];
-
-    // Iterate newest first
-    for (int idx = 0; idx < log_count && drawn < max_rows; idx++) {
-        int actual_idx = idx + start;
-        if (actual_idx >= log_count) break;
-
-        // Newest first: walk backwards from write pointer
-        int li = (log_write_idx - 1 - actual_idx + LOG_SIZE) % LOG_SIZE;
-        LogEntry &e = flight_log[li];
-
-        uint16_t color = pal->blip;
-        if (e.is_emergency) color = pal->blip_emg;
-        else if (e.is_military) color = pal->blip_mil;
-
-        tft.setTextColor(color, pal->bg);
-        tft.setTextDatum(TL_DATUM);
-
-        snprintf(buf, sizeof(buf), "%-8s", e.callsign);
-        tft.drawString(buf, 4, y, 1);
-
-        snprintf(buf, sizeof(buf), "%-4s", e.type_code);
-        tft.drawString(buf, 84, y, 1);
-
-        if (e.closest_nm < 9999)
-            snprintf(buf, sizeof(buf), "%.0f", e.closest_nm);
-        else
-            strlcpy(buf, "---", sizeof(buf));
-        tft.drawString(buf, 134, y, 1);
-
-        // Time ago
-        uint32_t ago_s = (now - e.first_seen) / 1000;
-        if (ago_s < 60) snprintf(buf, sizeof(buf), "%lus", ago_s);
-        else if (ago_s < 3600) snprintf(buf, sizeof(buf), "%lum", ago_s / 60);
-        else snprintf(buf, sizeof(buf), "%luh", ago_s / 3600);
-        tft.drawString(buf, 184, y, 1);
-
-        // Flags
-        const char *flag = "";
-        if (e.is_emergency) flag = "EMG";
-        else if (e.is_military) flag = "MIL";
-        tft.drawString(flag, 254, y, 1);
-
-        y += 14;
-        drawn++;
-    }
-
-    if (y < RADAR_Y + RADAR_H)
-        tft.fillRect(0, y, LCD_H_RES, RADAR_Y + RADAR_H - y, pal->bg);
+    // Info view button — bottom-right, outside radar circle
+    tft.fillRect(291, 219, 28, 20, pal->grid);
+    draw_plane_glyph(305, 229, pal->text);
 }
 
 // ---- Settings screen ----
 
-static uint32_t last_settings_draw = 0;
-
 static void draw_settings() {
-    uint32_t now = millis();
-    if (!view_changed && now - last_settings_draw < 500) return;
-
-    if (view_changed) {
-        tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
-        view_changed = false;
-    }
-    last_settings_draw = now;
+    if (!view_changed) return;
+    tft.fillRect(0, RADAR_Y, LCD_H_RES, RADAR_H, pal->bg);
+    view_changed = false;
 
     int y = RADAR_Y + 2;
     tft.setTextColor(pal->hdr, pal->bg);
     tft.setTextDatum(TL_DATUM);
     tft.drawString("SETTINGS", 4, y, 2);
 
-    char pg[8];
-    snprintf(pg, sizeof(pg), "%d/%d", settings_sel + 1, NUM_SETTINGS);
-    tft.setTextDatum(TR_DATUM);
-    tft.drawString(pg, 316, y, 1);
-
     y += 17;
     tft.drawLine(0, y, LCD_H_RES, y, pal->hdr);
-    y += 4;
+    y += 4;  // y = SETTINGS_FIRST_Y
 
     char buf[16];
     for (int i = 0; i < NUM_SETTINGS; i++) {
         bool sel = (i == settings_sel);
-        uint16_t label_color = sel ? pal->blip : pal->hdr;
-        uint16_t value_color = sel ? pal->blip : pal->text;
-        uint16_t row_bg = pal->bg;
+        uint16_t row_bg = sel ? pal->grid : pal->bg;
+        tft.fillRect(0, y, LCD_H_RES, SETTINGS_ROW_H, row_bg);
 
-        // Highlight selected row
-        if (sel) {
-            tft.fillRect(0, y, LCD_H_RES, 18, pal->grid);
-            row_bg = pal->grid;
-        } else {
-            tft.fillRect(0, y, LCD_H_RES, 18, pal->bg);
-        }
-
-        tft.setTextColor(label_color, row_bg);
+        tft.setTextColor(sel ? pal->blip : pal->hdr, row_bg);
         tft.setTextDatum(TL_DATUM);
-        tft.drawString(SETTINGS_LABELS[i], 8, y + 2, 2);
+        tft.drawString(SETTINGS_LABELS[i], 8, y + 3, 2);
 
-        // Value
         switch (i) {
-            case 0: strlcpy(buf, g_config.cycle_enabled ? "ON" : "OFF", sizeof(buf)); break;
-            case 1: snprintf(buf, sizeof(buf), "%ds", g_config.cycle_interval_s); break;
-            case 2: snprintf(buf, sizeof(buf), "%ds", g_config.cycle_inactivity_s); break;
-            case 3: strlcpy(buf, g_config.alert_military ? "ON" : "OFF", sizeof(buf)); break;
-            case 4: strlcpy(buf, g_config.alert_emergency ? "ON" : "OFF", sizeof(buf)); break;
-            case 5: strlcpy(buf, g_config.trails_enabled ? "ON" : "OFF", sizeof(buf)); break;
-            case 6: strlcpy(buf, g_config.trail_style ? "DOTS" : "LINE", sizeof(buf)); break;
+            case 0: strlcpy(buf, g_config.alert_military  ? "ON" : "OFF", sizeof(buf)); break;
+            case 1: strlcpy(buf, g_config.alert_emergency ? "ON" : "OFF", sizeof(buf)); break;
+            case 2: strlcpy(buf, g_config.trails_enabled  ? "ON" : "OFF", sizeof(buf)); break;
+            case 3: strlcpy(buf, g_config.trail_style     ? "DOTS" : "LINE", sizeof(buf)); break;
         }
-
-        tft.setTextColor(value_color, row_bg);
+        tft.setTextColor(sel ? pal->blip : pal->text, row_bg);
         tft.setTextDatum(TR_DATUM);
-        tft.drawString(buf, 308, y + 2, 2);
+        tft.drawString(buf, 308, y + 3, 2);
 
-        y += 22;
+        y += SETTINGS_ROW_H;
+    }
+    // y = SETTINGS_FIRST_Y + NUM_SETTINGS * SETTINGS_ROW_H = 153
+
+    y += 2;
+    tft.drawLine(0, y, LCD_H_RES, y, pal->grid);
+    y += 4;  // y = SETTINGS_OPT_Y = 159
+
+    if (settings_sel >= 0) {
+        const char *labels[3];
+        int active_opt;
+        int n_opts = get_setting_options(settings_sel, labels, &active_opt);
+        int btn_w = LCD_H_RES / n_opts;
+        const int btn_h = 40;
+
+        for (int i = 0; i < n_opts; i++) {
+            bool active = (i == active_opt);
+            uint16_t btn_bg = active ? pal->blip : pal->grid;
+            uint16_t btn_fg = active ? pal->bg : pal->text;
+            tft.fillRect(i * btn_w + 2, y, btn_w - 4, btn_h, btn_bg);
+            tft.setTextColor(btn_fg, btn_bg);
+            tft.setTextDatum(MC_DATUM);
+            tft.drawString(labels[i], i * btn_w + btn_w / 2, y + btn_h / 2, 2);
+        }
+    } else {
+        tft.setTextColor(pal->grid, pal->bg);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("tap row to edit", LCD_H_RES / 2, y + 20, 1);
+    }
+}
+
+// ---- Info view ----
+
+static void draw_info() {
+    uint32_t now = millis();
+    if (!view_changed && now - last_info_draw < 1000) return;
+    view_changed = false;
+    last_info_draw = now;
+
+    tft.fillRect(0, STATUS_H, LCD_H_RES, RADAR_H, pal->bg);
+
+    // Snapshot nearest aircraft from live list
+    Aircraft snap;
+    bool found = false;
+    float dist_val = 0.0f;
+
+    if (g_info_icao[0] && aircraft_list.lock(pdMS_TO_TICKS(50))) {
+        for (int i = 0; i < aircraft_list.count; i++) {
+            if (strcmp(aircraft_list.aircraft[i].icao_hex, g_info_icao) == 0) {
+                snap = aircraft_list.aircraft[i];
+                dist_val = distance_nm(snap.lat, snap.lon);
+                found = true;
+                break;
+            }
+        }
+        aircraft_list.unlock();
     }
 
-    // Footer hint
-    tft.setTextColor(pal->grid, pal->bg);
+    // If locked aircraft left range, reacquire nearest
+    if (!found) {
+        char alt_icao[7] = "";
+        if (find_nearest_aircraft(alt_icao, &dist_val)) {
+            strlcpy(g_info_icao, alt_icao, sizeof(g_info_icao));
+            enrichment_fetch(g_info_icao, "", "", info_enrichment_cb);
+            if (aircraft_list.lock(pdMS_TO_TICKS(50))) {
+                for (int i = 0; i < aircraft_list.count; i++) {
+                    if (strcmp(aircraft_list.aircraft[i].icao_hex, g_info_icao) == 0) {
+                        snap = aircraft_list.aircraft[i];
+                        found = true;
+                        break;
+                    }
+                }
+                aircraft_list.unlock();
+            }
+        }
+    }
+
+    if (!found) {
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.setTextDatum(MC_DATUM);
+        int mid_y = STATUS_H + RADAR_H / 2;
+        tft.drawString("NO AIRCRAFT", LCD_H_RES / 2, mid_y - 14, 4);
+        tft.drawString("OVERHEAD",    LCD_H_RES / 2, mid_y + 14, 4);
+        tft.fillRect(291, 215, 28, 24, pal->grid);
+        draw_radar_glyph(305, 227, pal->text);
+        return;
+    }
+
+    AircraftEnrichment *enr = g_info_enrich ? g_info_enrich : enrichment_get_cached(g_info_icao);
+
+    char buf[64];
+
+    // ── Identity ─────────────────────────────────────────────────────────
+
+    tft.setTextColor(pal->text, pal->bg);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(snap.callsign[0] ? snap.callsign : snap.icao_hex, 4, 22, 3);
+
+    // Badges (MIL/EMG) and airline — top-right
+    int badge_y = 22;
+    if (snap.is_military) {
+        tft.setTextColor(pal->blip_mil, pal->bg);
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString("MIL", 316, badge_y, 1);
+        badge_y += 10;
+    }
+    if (snap.is_emergency) {
+        tft.setTextColor(pal->blip_emg, pal->bg);
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString("EMG", 316, badge_y, 1);
+        badge_y += 10;
+    }
+    const char *airline_s = (enr && enr->airline[0]) ? enr->airline : snap.owner_op;
+    if (airline_s[0]) {
+        tft.setTextColor(pal->hdr, pal->bg);
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(airline_s, 316, badge_y, 1);
+    }
+
+    // Registration · type code · description
+    tft.setTextColor(pal->hdr, pal->bg);
+    tft.setTextDatum(TL_DATUM);
+    const char *desc_s = snap.desc[0] ? snap.desc : (enr && enr->model[0] ? enr->model : "");
+    char desc_trunc[30] = "";
+    if (desc_s[0]) strlcpy(desc_trunc, desc_s, sizeof(desc_trunc));
+    if (desc_trunc[0])
+        snprintf(buf, sizeof(buf), "%s  %s  %s",
+            snap.registration[0] ? snap.registration : "---",
+            snap.type_code[0] ? snap.type_code : "---",
+            desc_trunc);
+    else
+        snprintf(buf, sizeof(buf), "%s  %s",
+            snap.registration[0] ? snap.registration : "---",
+            snap.type_code[0] ? snap.type_code : "---");
+    tft.drawString(buf, 4, 47, 1);
+
+    // ICAO hex + category (dim)
+    tft.setTextColor(pal->fade_dim, pal->bg);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(snap.icao_hex, 4, 58, 1);
+    if (snap.category[0]) {
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(snap.category, 316, 58, 1);
+    }
+
+    tft.drawLine(0, 68, LCD_H_RES, 68, pal->grid);
+
+    // ── Live Stats ───────────────────────────────────────────────────────
+
+    const int RX = 162;  // right column X start
+
+    // ALT
+    tft.setTextDatum(TL_DATUM);
+    if (snap.on_ground)
+        strlcpy(buf, "GND", sizeof(buf));
+    else if (snap.altitude > 0)
+        snprintf(buf, sizeof(buf), "%ld ft", (long)snap.altitude);
+    else
+        strlcpy(buf, "---", sizeof(buf));
+    tft.setTextColor(pal->fade_dim, pal->bg); tft.drawString("ALT", 4, 72, 1);
+    tft.setTextColor(pal->text, pal->bg);     tft.drawString(buf, 28, 72, 1);
+
+    // SPD
+    snprintf(buf, sizeof(buf), snap.speed > 0 ? "%d kt" : "---", snap.speed);
+    tft.setTextColor(pal->fade_dim, pal->bg); tft.drawString("SPD", RX, 72, 1);
+    tft.setTextColor(pal->text, pal->bg);     tft.drawString(buf, RX + 24, 72, 1);
+
+    // HDG
+    snprintf(buf, sizeof(buf), snap.heading > 0 ? "%d\xB0" : "---", snap.heading);
+    tft.setTextColor(pal->fade_dim, pal->bg); tft.drawString("HDG", 4, 84, 1);
+    tft.setTextColor(pal->text, pal->bg);     tft.drawString(buf, 28, 84, 1);
+
+    // V/S
+    if (snap.vert_rate != 0)
+        snprintf(buf, sizeof(buf), "%+d fpm", (int)snap.vert_rate);
+    else
+        strlcpy(buf, "---", sizeof(buf));
+    tft.setTextColor(pal->fade_dim, pal->bg); tft.drawString("V/S", RX, 84, 1);
+    tft.setTextColor(pal->text, pal->bg);     tft.drawString(buf, RX + 24, 84, 1);
+
+    // DST
+    snprintf(buf, sizeof(buf), "%.1f nm", dist_val);
+    tft.setTextColor(pal->fade_dim, pal->bg); tft.drawString("DST", 4, 96, 1);
+    tft.setTextColor(pal->text, pal->bg);     tft.drawString(buf, 28, 96, 1);
+
+    // SQK
+    snprintf(buf, sizeof(buf), snap.squawk > 0 ? "%04d" : "---", snap.squawk);
+    tft.setTextColor(pal->fade_dim, pal->bg); tft.drawString("SQK", RX, 96, 1);
+    tft.setTextColor(pal->text, pal->bg);     tft.drawString(buf, RX + 24, 96, 1);
+
+    tft.drawLine(0, 108, LCD_H_RES, 108, pal->grid);
+
+    // ── Route ────────────────────────────────────────────────────────────
+
+    snprintf(buf, sizeof(buf), "ORIG  %s", snap.origin[0] ? snap.origin : "---");
+    tft.setTextColor(pal->hdr, pal->bg);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(buf, 4, 112, 1);
+
+    tft.setTextColor(pal->fade_dim, pal->bg);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("< prev   tap: next   hold: change >", LCD_H_RES / 2, RADAR_Y + RADAR_H - 8, 1);
+    tft.drawString(">", 160, 112, 1);
+
+    snprintf(buf, sizeof(buf), "DEST  %s", snap.dest[0] ? snap.dest : "---");
+    tft.setTextColor(pal->hdr, pal->bg);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 316, 112, 1);
+
+    // Full airport names from enrichment
+    tft.setTextColor(pal->fade_med, pal->bg);
+    if (enr && (enr->origin_airport[0] || enr->destination_airport[0])) {
+        char oname[22] = ""; char dname[22] = "";
+        strlcpy(oname, enr->origin_airport, sizeof(oname));
+        strlcpy(dname, enr->destination_airport, sizeof(dname));
+        tft.setTextDatum(TL_DATUM);
+        if (oname[0]) tft.drawString(oname, 4, 124, 1);
+        tft.setTextDatum(TR_DATUM);
+        if (dname[0]) tft.drawString(dname, 316, 124, 1);
+    } else {
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(enr && enr->loading ? "fetching route..." : "no route data", 160, 124, 1);
+    }
+
+    tft.drawLine(0, 136, LCD_H_RES, 136, pal->grid);
+
+    // ── Aircraft Details ──────────────────────────────────────────────────
+
+    if (enr && enr->loaded) {
+        // MFGR + YEAR
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.drawString("MFGR", 4, 140, 1);
+        tft.setTextColor(pal->text, pal->bg);
+        tft.drawString(enr->manufacturer[0] ? enr->manufacturer : "---", 34, 140, 1);
+        if (enr->year_built > 0) {
+            snprintf(buf, sizeof(buf), "YEAR  %d", enr->year_built);
+            tft.setTextColor(pal->fade_dim, pal->bg);
+            tft.setTextDatum(TR_DATUM);
+            tft.drawString(buf, 316, 140, 1);
+        }
+
+        // ENGS + CTRY
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.drawString("ENGS", 4, 152, 1);
+        tft.setTextColor(pal->text, pal->bg);
+        if (enr->engine_count > 0 && enr->engine_type[0])
+            snprintf(buf, sizeof(buf), "%d x %s", enr->engine_count, enr->engine_type);
+        else if (enr->engine_count > 0)
+            snprintf(buf, sizeof(buf), "%d", enr->engine_count);
+        else
+            strlcpy(buf, "---", sizeof(buf));
+        tft.drawString(buf, 34, 152, 1);
+        if (enr->registered_country[0]) {
+            snprintf(buf, sizeof(buf), "CTRY  %.16s", enr->registered_country);
+            tft.setTextColor(pal->fade_dim, pal->bg);
+            tft.setTextDatum(TR_DATUM);
+            tft.drawString(buf, 316, 152, 1);
+        }
+
+        // OWNER
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.drawString("OWN", 4, 164, 1);
+        tft.setTextColor(pal->text, pal->bg);
+        const char *own = enr->owner[0] ? enr->owner :
+                          (snap.owner_op[0] ? snap.owner_op : "---");
+        tft.drawString(own, 28, 164, 1);
+
+    } else {
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(enr && enr->loading ? "fetching details..." : "no detail data",
+                       160, 155, 1);
+    }
+
+    tft.drawLine(0, 176, LCD_H_RES, 176, pal->grid);
+
+    // ── Bottom: photo credit + back button ───────────────────────────────
+
+    if (enr && enr->photo_photographer[0]) {
+        tft.setTextColor(pal->fade_dim, pal->bg);
+        tft.setTextDatum(TL_DATUM);
+        snprintf(buf, sizeof(buf), "Photo: %.40s", enr->photo_photographer);
+        tft.drawString(buf, 4, 195, 1);
+    }
+
+    tft.fillRect(291, 215, 28, 24, pal->grid);
+    draw_radar_glyph(305, 227, pal->text);
 }
 
 // ---- Alert overlay ----
@@ -1372,34 +1289,7 @@ static void update_once_per_sec() {
 // ---- Auto-cycle ----
 
 static void auto_cycle() {
-    if (!g_config.cycle_enabled) return;
-    if (current_view == VIEW_LOADING || current_view == VIEW_DETAIL || current_view == VIEW_SETTINGS) return;
-
-    uint32_t now = millis();
-
-    // Paused if recent touch
-    if ((now - last_touch_time) < ((uint32_t)g_config.cycle_inactivity_s * 1000)) return;
-
-    // Dwell time depends on view
-    uint32_t dwell_ms;
-    switch (current_view) {
-        case VIEW_STATS: dwell_ms = 5000; break;
-        case VIEW_LOG:   dwell_ms = 10000; break;
-        default:         dwell_ms = (uint32_t)g_config.cycle_interval_s * 1000; break;
-    }
-
-    if ((now - last_cycle_time) >= dwell_ms) {
-        last_cycle_time = now;
-        // Cycle through: RADAR -> ARRIVALS -> STATS -> LOG -> RADAR (skip DETAIL)
-        switch (current_view) {
-            case VIEW_RADAR:    current_view = VIEW_ARRIVALS; view_changed = true; break;
-            case VIEW_ARRIVALS: current_view = VIEW_STATS;    view_changed = true; break;
-            case VIEW_STATS:    current_view = VIEW_LOG;      view_changed = true; break;
-            case VIEW_LOG:      current_view = VIEW_RADAR;    radar_needs_full_redraw = true; break;
-            default: break;
-        }
-        draw_status_bar(true);
-    }
+    // Only radar and settings remain; nothing to auto-cycle between
 }
 
 // ---- Setup ----
@@ -1420,6 +1310,7 @@ void setup() {
     tft.init();
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
+    status_spr.createSprite(LCD_H_RES, STATUS_H);
 
     // Touch
     touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
@@ -1472,23 +1363,14 @@ void loop() {
             saved_ty = ty;
             if (!long_press_fired && (now - touch_down_time) >= LONG_PRESS_MS) {
                 long_press_fired = true;
-                if (saved_tx >= TOUCH_LEFT_MAX && saved_tx <= TOUCH_RIGHT_MIN) {
-                    if (current_view == VIEW_STATS)
-                        toggle_night_mode();
-                    else if (current_view == VIEW_SETTINGS)
-                        settings_adjust_selected();
-                }
             }
         }
     } else {
         if (touch_was_down && !long_press_fired) {
             switch (current_view) {
-                case VIEW_RADAR:    handle_touch_radar(saved_tx); break;
-                case VIEW_ARRIVALS: handle_touch_arrivals(saved_tx, saved_ty); break;
-                case VIEW_STATS:    handle_touch_stats(saved_tx, false); break;
-                case VIEW_DETAIL:   handle_touch_detail(saved_tx); break;
-                case VIEW_LOG:      handle_touch_log(saved_tx); break;
-                case VIEW_SETTINGS: handle_touch_settings(saved_tx); break;
+                case VIEW_RADAR:    handle_touch_radar(saved_tx, saved_ty); break;
+                case VIEW_INFO:     handle_touch_info(saved_tx, saved_ty); break;
+                case VIEW_SETTINGS: handle_touch_settings(saved_tx, saved_ty); break;
                 default: break;
             }
             draw_status_bar(true);
@@ -1525,10 +1407,7 @@ void loop() {
             draw_status_bar(false);
             switch (current_view) {
                 case VIEW_RADAR:    draw_radar(); break;
-                case VIEW_ARRIVALS: draw_arrivals(); break;
-                case VIEW_STATS:    draw_stats(); break;
-                case VIEW_DETAIL:   draw_detail(); break;
-                case VIEW_LOG:      draw_log(); break;
+                case VIEW_INFO:     draw_info(); break;
                 case VIEW_SETTINGS: draw_settings(); break;
                 default: break;
             }

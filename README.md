@@ -1,29 +1,25 @@
+> **This is a fork of [iamneilroberts/adsb-cyd](https://github.com/iamneilroberts/adsb-cyd).**
+
 # ADS-B Radar — CYD Edition
 
-A real-time aircraft radar display for the **ESP32-2432S028** (aka "Cheap Yellow Display" / CYD). Tracks aircraft using the ADS-B Exchange API and displays them on a 320x240 TFT screen with touch interaction.
+A real-time aircraft radar display for the **ESP32-2432S028** (aka "Cheap Yellow Display" / CYD). Tracks aircraft using the ADS-B Exchange API and displays them on a 320×240 TFT screen with touch interaction.
 
 No PSRAM required. No LVGL. Just direct TFT_eSPI rendering on a $15 board.
 
 ## Features
 
 - **Radar view** — sweeping radar with aircraft blips, trails, heading lines, and sweep-based fading
-- **Arrivals board** — tabular list with callsign, route, altitude, speed, distance
-- **Stats dashboard** — uptime, WiFi, fetch stats, closest/highest/fastest aircraft
-- **Flight log** — circular buffer of 50 recently seen aircraft
-- **Detail view** — full aircraft info (type, operator, route, squawk, IAS/TAS/Mach)
-- **Settings screen** — configure auto-cycle, alerts, trails via touch (persisted to NVS)
-- **Compass rose** — N/S/E/W labels on radar
-- **Auto-cycle** — automatically rotates views, pauses on touch
-- **Brightness control** — PWM backlight, adjustable from stats view
-- **Night mode** — amber/red palette, long-press to toggle
+- **Info view** — full detail on the nearest aircraft, resolved via the `/v2/closest/` API
+- **Settings screen** — configure alerts and trails via touch (persisted to NVS)
+- **Compass rose** — N/S/E/W labels on radar rings
 - **Filters** — cycle through ALL/COM/MIL/EMG/HELI/FAST/SLOW/ODD
-- **Sort modes** — arrivals sortable by distance, altitude, or speed
 - **Mil/Emergency alerts** — flashing border + banner on military/emergency aircraft
-- **Closest approach record** — tracks the nearest aircraft ever seen
+- **Closest approach record** — tracks the nearest aircraft seen this session
+- **Flight enrichment** — route origin/destination fetched from adsbdb.com
 
 ## Hardware
 
-- **ESP32-2432S028** (ESP32-WROOM-32 with 2.8" ILI9341 320x240 TFT + XPT2046 touch)
+- **ESP32-2432S028** (ESP32-WROOM-32 with 2.8" ILI9341 320×240 TFT + XPT2046 touch)
 - Available on AliExpress/Amazon for ~$15
 - No additional wiring needed — everything is on-board
 
@@ -32,7 +28,7 @@ No PSRAM required. No LVGL. Just direct TFT_eSPI rendering on a $15 board.
 ![CYD board back](images/ESP32-Cheap-Yellow-Display-CYD-Board-ESP32-2432S028R-back-labeled.jpg)
 
 Key components (viewing the back of the board):
-- **Micro USB** (left side) — for power, programming, and serial monitor
+- **USB** (left side) — for power, programming, and serial monitor
 - **BOOT button** — near the center of the board, next to the speaker
 - **RST button** — top-right corner
 - **ESP-WROOM-32** — the metal-shielded module on the right
@@ -67,27 +63,33 @@ Then **log out and back in** (or reboot) for this to take effect.
 ### 3. Clone this repo
 
 ```bash
-git clone https://github.com/iamneilroberts/adsb-cyd.git
-cd adsb-cyd
+git clone https://github.com/jdsan9/esp32-adsb-radar.git
+cd esp32-adsb-radar
 ```
 
 ### 4. Configure your location
 
-Edit `src/config.h` and set your WiFi credentials and home coordinates:
+Copy the example config and fill in your details:
+
+```bash
+cp src/config.h.example src/config.h
+```
+
+Then edit `src/config.h`:
 
 ```c
-#define WIFI_SSID "YourWiFiName"
-#define WIFI_PASS "YourWiFiPassword"
+#define WIFI_SSID "your_wifi_ssid"
+#define WIFI_PASS "your_wifi_password"
 
-#define HOME_LAT 30.6905    // Your latitude
-#define HOME_LON -88.1632   // Your longitude
+#define HOME_LAT 38.897957  // Your latitude
+#define HOME_LON -77.036560 // Your longitude
 ```
 
 You can find your coordinates at [latlong.net](https://www.latlong.net/).
 
 ### 5. Connect the CYD
 
-Plug in the CYD via the **Micro USB** port (left side of the board, when viewing from the back). **Use a data cable, not a charge-only cable** — if the board isn't detected, the cable is the most likely cause.
+Plug in the CYD via the **USB** port (left side of the board, when viewing from the back). **Use a data cable, not a charge-only cable** — if the board isn't detected, the cable is the most likely cause.
 
 Verify the board is detected:
 
@@ -158,55 +160,57 @@ pio device monitor
 | Upload still fails after BOOT/RST | Try a lower baud rate: add `upload_speed = 115200` to `platformio.ini`. Also try a different USB cable. |
 | "Invalid head of packet" every time | Some CYD boards have two serial chips (CH340 + CP2102). The CH340 is the programming port. If you see two `/dev/ttyUSB*` devices, try the other one. On Linux, run `lsusb` to identify which is which. |
 | Screen is white/blank after flash | Check WiFi credentials in `src/config.h`. Open serial monitor (`pio device monitor`) to see error messages. |
-| No aircraft showing | Verify your coordinates are correct. Make sure you're within range of aircraft (75nm default). The free API may have brief outages — wait a minute and check again. |
+| No aircraft showing | Verify your coordinates are correct in `src/config.h`. Make sure you're within range of aircraft (`ADSB_RADIUS_NM`, default 20nm). The free API may have brief outages — wait a minute and check again. |
 
 ## Touch Controls
 
-The screen is divided into three vertical zones: **left 45%**, **center 10%**, **right 45%**. The narrow center zone prevents accidental view changes. Tap for a short press, or hold for 1 second for a long press.
+### Status bar (top strip, all views)
 
-| View | Left tap | Center tap | Center HOLD (1s) | Right tap |
-|------|----------|------------|------------------|-----------|
-| **Radar** | Cycle filter (ALL → COM → MIL → EMG → HELI → FAST → SLOW → ODD) | Next view | — | Cycle range (150 → 100 → 50 → 20 → 5nm) |
-| **Arrivals** | Cycle sort (DST → ALT → SPD) | Tap aircraft row → Detail view | — | Cycle range |
-| **Stats** | Brightness down (-12%) | Next view | Toggle night mode (green/amber) | Brightness up (+12%) |
-| **Log** | Previous page | Next view | — | Next page |
-| **Settings** | Previous setting | Next view | Toggle/change selected setting | Next setting |
-| **Detail** | Previous aircraft | Back to Radar | — | Next aircraft |
+| Tap zone | Action |
+|----------|--------|
+| Left — WiFi indicator | Open Settings |
+| Center — aircraft count / filter | Cycle filter |
+| Right — range | Cycle range |
 
-**View cycle:** Radar → Arrivals → Stats → Log → Settings → Radar
+### Radar view
 
-**Detail view** is not part of the normal cycle — tap an aircraft row in the Arrivals list to open it.
+| Touch target | Action |
+|-------------|--------|
+| Status bar | See above |
+| Bottom-right corner | Open Nearest Aircraft view |
 
-## Settings Screen
+### Nearest Aircraft view
 
-Navigate to the settings screen by tapping through views (Radar → Arrivals → Stats → Log → **Settings**).
+| Touch target | Action |
+|-------------|--------|
+| Status bar | See above |
+| Bottom-right corner | Back to Radar |
 
-- Tap **left/right** to highlight a setting
-- **Long-press middle** (hold for 1 second) to toggle or cycle the value
-- Changes save to flash immediately and persist across reboots
+### Settings view
 
-Available settings:
-| Setting | Values |
-|---------|--------|
-| Auto Cycle | ON / OFF |
-| Cycle Interval | 15s / 30s / 60s / 90s |
-| Inactivity Pause | 30s / 60s / 120s |
-| Alert Military | ON / OFF |
-| Alert Emergency | ON / OFF |
-| Trails | ON / OFF |
-| Trail Style | LINE / DOTS |
+| Touch target | Action |
+|-------------|--------|
+| Status bar left | Back to Radar |
+| Tap a row | Select row and show available options |
+| Tap an option | Apply the setting |
+
+## Settings
+
+Navigate to settings by tapping the WiFi indicator (left of status bar) from any view.
+
+Tap a row to select it — options appear at the bottom of the screen. Tap an option to apply it. Changes save to flash immediately and persist across reboots.
+
+| Setting | Options | Default |
+|---------|---------|---------|
+| Alert Military | ON / OFF | ON |
+| Alert Emergency | ON / OFF | ON |
+| Trails | ON / OFF | ON |
+| Trail Style | LINE / DOTS | DOTS |
 
 ## Data Sources
 
-- **Aircraft positions:** [api.adsb.lol](https://api.adsb.lol) (free, no API key)
-- **Enrichment data:** [adsbdb.com](https://www.adsbdb.com) (callsign/aircraft lookups)
-
-## Flash Usage
-
-```
-RAM:   19.8% (64KB / 320KB)
-Flash: 88.0% (1.15MB / 1.31MB) — ~157KB free
-```
+- **Aircraft positions & closest lookup:** [api.adsb.lol](https://api.adsb.lol) (free, no API key)
+- **Route enrichment:** [adsbdb.com](https://www.adsbdb.com) (origin/destination lookups)
 
 ## License
 

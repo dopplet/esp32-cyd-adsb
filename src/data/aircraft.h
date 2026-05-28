@@ -37,9 +37,6 @@ struct Aircraft {
     float mach;             // Mach number (0 = not available)
     int16_t ias;            // indicated airspeed kts (0 = n/a)
     int16_t tas;            // true airspeed kts (0 = n/a)
-    int32_t nav_altitude;   // autopilot target altitude ft (0 = n/a)
-    float roll;             // bank angle degrees (0 = wings level or n/a)
-    float nav_qnh;          // altimeter setting hPa (0 = n/a)
     uint32_t last_seen;     // millis() timestamp
     uint32_t stale_since;   // 0 = fresh, else millis() when first went stale
     TrailPoint trail[TRAIL_LENGTH];
