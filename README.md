@@ -1,6 +1,6 @@
-> **This is a fork of [iamneilroberts/adsb-cyd](https://github.com/iamneilroberts/adsb-cyd).**
+> **Built on top of the great work from [iamneilroberts/adsb-cyd](https://github.com/iamneilroberts/adsb-cyd).**
 
-# ADS-B Radar — CYD Edition
+# ESP32 ADS-B Radar — CYD Edition
 
 A real-time aircraft radar display for the **ESP32-2432S028** (aka "Cheap Yellow Display" / CYD). Tracks aircraft using the ADS-B Exchange API and displays them on a 320×240 TFT screen with touch interaction.
 
