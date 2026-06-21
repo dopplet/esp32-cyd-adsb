@@ -37,11 +37,15 @@ UserConfig storage_load_config() {
 
     _prefs.begin("adsb", true); // read-only
 
-    // Override with NVS values where they exist
-    if (_prefs.isKey("ssid"))
-        strlcpy(cfg.wifi_ssid, _prefs.getString("ssid", cfg.wifi_ssid).c_str(), sizeof(cfg.wifi_ssid));
-    if (_prefs.isKey("pass"))
-        strlcpy(cfg.wifi_pass, _prefs.getString("pass", cfg.wifi_pass).c_str(), sizeof(cfg.wifi_pass));
+    // Only restore NVS WiFi if the compiled defaults haven't changed since last flash.
+    // If they differ, the user reflashed with new config.h credentials — compiled values win.
+    bool wifi_sentinel_ok = (_prefs.getString("def_ssid", "") == WIFI_SSID);
+    if (wifi_sentinel_ok) {
+        if (_prefs.isKey("ssid"))
+            strlcpy(cfg.wifi_ssid, _prefs.getString("ssid", cfg.wifi_ssid).c_str(), sizeof(cfg.wifi_ssid));
+        if (_prefs.isKey("pass"))
+            strlcpy(cfg.wifi_pass, _prefs.getString("pass", cfg.wifi_pass).c_str(), sizeof(cfg.wifi_pass));
+    }
     cfg.home_lat = _prefs.getFloat("lat", cfg.home_lat);
     cfg.home_lon = _prefs.getFloat("lon", cfg.home_lon);
     cfg.radius_nm = _prefs.getInt("radius", cfg.radius_nm);
@@ -63,6 +67,16 @@ UserConfig storage_load_config() {
     cfg.arrivals_filter_idx = _prefs.getInt("arr_filt", cfg.arrivals_filter_idx);
 
     _prefs.end();
+
+    if (!wifi_sentinel_ok) {
+        _prefs.begin("adsb", false);
+        _prefs.putString("def_ssid", WIFI_SSID);
+        _prefs.remove("ssid");
+        _prefs.remove("pass");
+        _prefs.end();
+        Serial.println("Storage: compiled WiFi changed — NVS credentials cleared");
+    }
+
     Serial.println("Storage: config loaded from NVS");
     return cfg;
 }
