@@ -270,6 +270,8 @@ static void fetch_task(void *param) {
                 HTTPClient http;
                 http.begin(client, url);
                 http.setTimeout(10000);
+                http.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36");
+                http.addHeader("Accept", "application/json");
                 uint32_t t0 = millis();
                 int httpCode = http.GET();
                 Serial.printf("Fetch: HTTP %d, %lums, heap=%lu\n",
