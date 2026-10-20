@@ -1308,7 +1308,9 @@ void setup() {
 
     // Display
     tft.init();
+    tft.invertDisplay(true);
     tft.setRotation(1);
+
     tft.fillScreen(TFT_BLACK);
     status_spr.createSprite(LCD_H_RES, STATUS_H);
 
