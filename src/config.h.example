@@ -5,8 +5,8 @@
 #define WIFI_PASS "your_wifi_password"
 
 // Home location (latitude, longitude)
-#define HOME_LAT 38.897957
-#define HOME_LON -77.036560
+#define HOME_LAT 44.0589
+#define HOME_LON -79.4611
 
 
 // ADS-B settings — reduced for CYD (no PSRAM, 320KB DRAM)
