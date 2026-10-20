@@ -11,7 +11,7 @@
 
 // ADS-B settings — reduced for CYD (no PSRAM, 320KB DRAM)
 #define ADSB_RADIUS_NM 20
-#define ADSB_POLL_INTERVAL_MS 7500
+#define ADSB_POLL_INTERVAL_MS 15000
 #define MAX_AIRCRAFT 15
 #define TRAIL_LENGTH 15
 
